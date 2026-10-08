@@ -654,4 +654,29 @@ export function Modal({ isOpen, onClose, children }: ModalProps) {
 }
 ```
 
+## Resume-an-action-after-login (pending-intent with TTL)
+
+When an unauthenticated user clicks "Apply" / "Subscribe" / "Save", don't drop the intent at the login
+redirect. Persist it and replay it after auth:
+- A tiny `utils/pendingIntent.js` with `save/read/clear` that stamps `{ ...payload, createdAt,
+  expiresAt: now + 20*60_000 }` into `localStorage`, and **self-purges on read** if expired or
+  malformed (wrap `JSON.parse` in try/catch → clear). Keep one key per intent kind
+  (apply-selection, saved-job, subscription, repay-return).
+- Bounce to `/login?next=apply`; a `LoginRoute` reads the pending marker after a successful login and
+  redirects to the right place, resuming the flow. The action survives the round-trip with no server
+  state.
+- Same shape works for multi-step wizards that hit an auth wall mid-flow: save `{step, selections}`,
+  send to login, restore on return so the user lands back on the step they left.
+
+## Google Translate widget without mangling your icons (googtrans cookie control)
+
+For a no-library EN↔BN (or any-lang) toggle via the Google Translate element, two tricks make it
+production-usable:
+- **Own the `googtrans` cookie.** To switch language deterministically, expire the conflicting cookie
+  at **every** domain level (host, `.host`, bare domain) then set `googtrans=/en/bn` and reload —
+  otherwise a stale cookie on a parent domain wins and the toggle appears dead.
+- **Stop Translate from rewriting icon fonts / SVGs.** A `MutationObserver` that tags every `svg` (and
+  icon-font element) with `translate="no"` as nodes mount keeps Google Translate from replacing glyphs
+  with translated text and breaking your iconography.
+
 **Remember**: Modern frontend patterns enable maintainable, performant user interfaces. Choose patterns that fit your project complexity.

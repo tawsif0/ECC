@@ -3,6 +3,7 @@ name: verification-loop
 description: A comprehensive verification system for Claude Code sessions.
 metadata:
   origin: ECC
+description: "検証ループスキル"
 ---
 
 # 検証ループスキル

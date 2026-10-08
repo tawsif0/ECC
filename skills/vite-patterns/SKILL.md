@@ -257,6 +257,192 @@ manualChunks(id) {
 }
 ```
 
+#### Isolate animation/3D-heavy libraries into their own vendor chunks
+Apps that pull in three.js/r3f, GSAP, framer-motion, and html2canvas together balloon the main bundle if
+those land in one generic `vendor` chunk. Split each into its own cacheable chunk so a change to app code
+doesn't invalidate the (large, rarely-changing) animation vendor chunks:
+```typescript
+manualChunks(id) {
+  if (id.includes('three') || id.includes('@react-three')) return 'three-vendor'
+  if (id.includes('gsap')) return 'gsap-vendor'
+  if (id.includes('framer-motion')) return 'framer-vendor'
+  if (id.includes('html2canvas')) return 'html2canvas-vendor'
+}
+```
+Pair with `vite-plugin-compression` (gzip + brotli, `threshold: 1024`) so the static host serves
+pre-compressed assets instead of compressing on every request.
+
+#### A manual chunk can silently force a static import of a dynamically-imported module
+Rollup/Rolldown's shared dynamic-import preload-helper is a virtual module every code-split chunk depends
+on. If a `manualChunks` function's `node_modules` bucket check runs before checking for this virtual
+module, the helper (and any real package matched by the same broad check, e.g. a rich-text editor lib)
+lands inside a manually-chunked bucket — which forces that whole chunk to be loaded eagerly from the
+entry, silently defeating a `React.lazy`/`import()` you wrote specifically to keep it out of the initial
+bundle. Symptom: a component wrapped in `React.lazy` still shows up in the eager network trace. Fix: route
+the virtual preload-helper id to your baseline vendor chunk explicitly, and check for it (and any other
+lazy-loaded package) *before* the generic `node_modules` fallback:
+```js
+manualChunks(id) {
+  if (id.includes('vite/preload-helper')) return 'vendor'   // check first — it's a virtual module id
+  if (id.includes('node_modules/quill')) return 'editor'    // route lazy-only libs to their own chunk
+  if (id.includes('node_modules')) return 'vendor'
+}
+```
+Verify with a real network trace (not just reading the config) that the lazy chunk only loads on the
+triggering interaction, not on initial page load.
+
+#### ⚠️ Never split the React runtime or the router into their own chunks
+This refines the `'react-vendor': ['react', 'react-dom']` recipe above: it is safe only while the *whole*
+React runtime family stays in one bucket. `react`, `react-dom`, `scheduler` and `react-router` reference
+each other, so routing them to separate named chunks creates a **circular chunk dependency** that survives
+the build and crashes at load with a message that looks nothing like a bundling problem:
+```
+Uncaught TypeError: Cannot set properties of undefined (setting 'Children')
+```
+Because the build itself succeeds, this ships. Keep the React runtime in the single baseline `vendor`
+chunk and split only clearly-independent heavy *leaf* libraries (charts, animation, icons, PDF, editor):
+```js
+manualChunks(id) {
+  if (id.includes('vite/preload-helper')) return 'vendor'
+  if (!id.includes('node_modules')) return undefined
+  // do NOT add react / react-dom / scheduler / react-router buckets here
+  if (id.includes('recharts') || id.includes('/d3')) return 'charts'
+  if (id.includes('framer-motion')) return 'motion'
+  if (id.includes('react-icons')) return 'icons'
+  if (id.includes('jspdf')) return 'pdf'
+  if (id.includes('quill')) return 'editor'
+  return 'vendor'
+}
+```
+
+#### Leave a library's OWN optional dynamic deps unbucketed (`return undefined`)
+Some libraries `import()` heavy optional deps themselves, for features you may never call — jsPDF
+dynamically imports `html2canvas` and `canvg` (plus `pako`) purely for its optional `.html()` /
+`.addSvgAsImage()` paths. If you draw PDFs with plain text/shape primitives, those have **zero call sites**
+in your app. But a catch-all `return 'vendor'` at the end of `manualChunks` sweeps them up and *statically*
+bundles 500KB+ into every page's eager load, defeating the library's own lazy boundary. Return `undefined`
+so Rollup keeps them as their own small async chunks that only fetch if some code path actually awaits
+that `import()`:
+```js
+if (id.includes('html2canvas') || id.includes('canvg') || id.includes('/pako/')) return undefined
+```
+Caveat on the "isolate animation/3D-heavy libraries" recipe above: give `html2canvas` a *named* chunk only
+when your code genuinely calls it. When it is reached solely through another library's optional
+`import()`, naming it is strictly worse than leaving it unmatched. Rule of thumb: a named bucket makes a
+dep **eager within that chunk**; `undefined` lets it stay **on-demand**. Verify in a network trace which
+of the two you actually got.
+
+#### ⚠️ Correction: a library's *optional* dep gets `undefined`; its *real* transitive dep goes INTO the lazy bucket
+The rule above is right about `html2canvas`/`canvg` but **wrong to lump `/pako/` in with them** — which
+branch a transitive dep belongs in depends on whether *your* code path reaches it, and the two look
+identical in a dependency tree. For jsPDF specifically:
+
+| Dep | Reached by | Correct bucket |
+|---|---|---|
+| `html2canvas`, `canvg` | only `.html()` / `.addSvgAsImage()` — optional features | `undefined` (stay on-demand) |
+| `pako`, `fast-png`, `iobuffer` | `addImage('PNG', …)` — e.g. the logo on an invoice | same bucket as `jspdf` |
+
+`addImage('PNG')` decodes through `fast-png` → `pako`. Those are a **real** dependency of a path you do
+call, so `undefined` is not the win it looks like: the chunk gets fetched anyway, just as extra
+round-trips. Naming them into the parent's lazy bucket keeps them lazy *with* it. Returning `'vendor'`
+(or falling through to the catch-all) is the actual bug — it ships a decompressor on every page for a
+feature most visitors never trigger:
+```js
+if (id.includes('html2canvas') || id.includes('canvg')) return undefined      // optional → on-demand
+if (id.includes('jspdf') || id.includes('/pako/') ||
+    id.includes('/fast-png/') || id.includes('/iobuffer/')) return 'pdf'      // real → lazy with parent
+```
+**Decision test:** grep your own source for a call site. No call site anywhere → `undefined`. A call site
+behind a lazy boundary → the parent's named bucket. A call site on an eager page → leave it in `vendor`.
+
+#### A package-name match misses the library's sibling runtime packages
+`id.includes('framer-motion')` does **not** catch `motion-dom` / `motion-utils`, which is where much of
+the runtime actually lives — they fall through to the catch-all `vendor` and the animation split quietly
+achieves almost nothing. Match every sibling, and delimit with slashes so a substring can't claim an
+unrelated package:
+```js
+if (id.includes('framer-motion') || id.includes('/motion-dom/') || id.includes('/motion-utils/')) return 'motion'
+```
+Check for this after any bundle-split pass: `ls dist/assets` and compare the `motion-*.js` size against
+the library's real install size. Much smaller means the rest leaked into `vendor`. Same class of bug for
+any scoped family (`@tiptap/*`, `d3-*`, `@react-three/*`).
+
+#### "It's only imported behind a lazy route" does not keep it out of the eager chunk
+A library imported *solely* by admin screens that already sit behind `lazy(() => import('./Dashboard'))`
+still lands in `vendor` without its own named bucket — `manualChunks`'s catch-all wins over the dynamic
+boundary. The lazy route is necessary but not sufficient; the library needs a bucket of its own:
+```js
+if (id.includes('jsbarcode')) return 'barcode'   // admin-only screens, zero storefront call sites
+```
+General rule for this and the `quill` case above: **every** library whose call sites are all behind a
+dynamic import needs an explicit named bucket, or the catch-all re-anchors it to the eager chunk.
+
+#### ⚠️ The named bucket still leaks: a library's transitive deps usually don't carry its name
+`if (id.includes('quill')) return 'editor'` looks like it closes the case above — and it catches almost
+nothing. Quill's runtime lives in packages whose paths contain **no** "quill" at all (`parchment`,
+`fast-diff`, `lodash.isequal`, `lodash.clonedeep`, and its own `lodash-es`), so every one of them falls
+through to the catch-all and ships to every page: ~220KB of editor-only code, with the bundle report
+showing a tidy little `editor-*.js` that makes the split look done. This is the sibling-package bug one
+level deeper — `motion-dom` at least *looks* related to `framer-motion`; `parchment` and `fast-diff` give
+you nothing to pattern-match on. **Read the lockfile's dependency list for the library, don't guess from
+the name:**
+```js
+if (id.includes('quill') || id.includes('/parchment/') || id.includes('/fast-diff/') ||
+    id.includes('/lodash.isequal/') || id.includes('/lodash.clonedeep/') ||
+    id.includes('/lodash-es/')) return 'editor'
+```
+Verification is the same as for siblings: compare `editor-*.js` in `ls dist/assets` against the library's
+real install size (`du -sh node_modules/quill node_modules/parchment …`). Far smaller = still leaking.
+
+#### ⚠️ A transitive dep shared by TWO feature buckets must be left unmatched
+The fix above has a hard limit, and over-applying it is its own bug. Quill *also* depends on
+`eventemitter3` — but so does `recharts`. Adding `eventemitter3` to the `editor` bucket drags it out of
+reach of the charts chunk, so charts now pull the editor chunk (or vice versa if you assign it to
+`charts`); either way one feature's visitors download the other's code. **Leave a dep with importers in
+two different buckets unmatched** and let Rollup place it — it will duplicate the few KB into both async
+chunks, or hoist it to a shared one, which is correct in a way no single hand-assignment can be:
+```js
+// deliberately NOT in 'editor' or 'charts': both quill and recharts import it
+if (id.includes('eventemitter3')) return undefined
+```
+**Decision test before adding any transitive dep to a named bucket:** grep `node_modules` for its other
+importers (`grep -rl '"eventemitter3"' node_modules/*/package.json`). One importer → safe to bucket with
+its parent. Two or more in *different* buckets → leave it unmatched. This is also why a pure
+`id.includes('lodash')` match is dangerous where the catch-all `/lodash-es/` line above is safe only
+because nothing else in the tree used it — re-check that assumption per project.
+
+#### Route-level code splitting: make exactly one route eager
+The cheapest large win on a storefront/app entry payload is to `lazy()` **every** route except the single
+landing page almost every session touches first, keeping shared chrome (nav, footer, drawers, toasts)
+statically imported since every page renders it:
+```jsx
+import Home from '../features/home/pages/Home'            // the one eager route
+import Navbar from '…/Navbar'                             // chrome — on every page, keep static
+const Login = lazy(() => import('../features/auth/pages/Login'))
+const Checkout = lazy(() => import('…/CheckOut'))
+const Dashboard = lazy(() => import('…/admin/pages/Dashboard'))   // whole admin tree, one chunk
+…
+<Suspense fallback={<PageSkeleton />}><Routes>…</Routes></Suspense>
+```
+Pair it with the `preload-helper → 'vendor'` line above: route splitting is what *creates* the shared
+preload helper, so adding `lazy()` routes without that line is how the helper gets anchored to a random
+heavy bucket and silently undoes the split.
+
+#### Post-build JS obfuscation (protect a client-facing bundle's source)
+For a commercial frontend where the shipped JS shouldn't be trivially readable, chain a `javascript-obfuscator`
+pass onto the build as a separate npm script — run it only on non-vendor chunks so the animation/UI vendor
+chunks (already public library code) don't bloat or break:
+```json
+// package.json
+"build:obfuscated": "vite build && node scripts/obfuscate-dist.mjs"
+```
+```js
+// scripts/obfuscate-dist.mjs — obfuscator config
+{ identifierNamesGenerator: 'hexadecimal', stringArray: true, stringArrayThreshold: 0.75,
+  transformObjectKeys: true, controlFlowFlattening: false }   // flattening off: keeps build time sane
+```
+Glob `dist/assets/*.js` excluding filenames matching known vendor-chunk prefixes before obfuscating.
+
 ### Performance
 
 #### Avoid Barrel Files

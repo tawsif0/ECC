@@ -182,6 +182,25 @@ if (user.role === "admin") {
 
 Trigger `<link rel="preload">` or `import()` on hover so the bundle is in cache by the time the user clicks.
 
+### Split the cheap check from the heavy import
+
+A component that both *decides whether to show* an action and *performs* it (e.g. "show Download Invoice
+button if available" + "generate the PDF") pulls in the heavy library (a PDF generator, a rich-text editor)
+just to answer the cheap boolean, even on routes where the action is never triggered. Extract the
+availability check into its own lib-free module, and re-export the original module from it for existing
+callers so no call site needs to change:
+```ts
+// availability.ts — no heavy import, safe to pull in anywhere (e.g. a public storefront page)
+export function isInvoiceAvailable(order) { return order.status === "delivered"; }
+
+// invoicePdf.ts — re-exports for back-compat, still the only place importing the heavy lib
+export { isInvoiceAvailable } from "./availability";
+export async function downloadInvoicePdf(order) { /* uses jsPDF */ }
+```
+Then `await import("./invoicePdf")` only inside the click handler that actually generates the file — the
+button that merely renders conditionally never touches the heavy import. Confirm with a network trace that
+the heavy chunk loads only on the click, not on page mount.
+
 ## 3. Server-Side Performance (HIGH)
 
 ### Authenticate Server Actions like API routes

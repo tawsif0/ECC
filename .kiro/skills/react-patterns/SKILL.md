@@ -341,3 +341,104 @@ const NotificationsContext = createContext<Notification[]>([]);
 
 // A component that only consumes ThemeContext does NOT re-render when notifications change
 ```
+
+## Hand-rolled async UI: four traps a query library would have handled
+
+When you can't reach for TanStack Query (a one-off widget, a legacy screen, a plain `fetch` in a
+component), you inherit the problems it solves. Each of these shipped as a real bug.
+
+### 1. Out-of-order responses — guard with a request sequence, not just a debounce
+
+A debounce reduces requests; it does not order them. A slow older query resolving after a newer one
+overwrites correct results with stale ones (typing `abandon` can leave you looking at results for `ab`).
+Stamp each request and discard anything that isn't the latest:
+
+```tsx
+const reqId = useRef(0);
+async function search(q: string) {
+  const id = ++reqId.current;
+  const data = await searchApi(q);
+  if (id !== reqId.current) return;      // a newer request already started — drop this response
+  setResults(data);
+}
+// Clearing the input / toggling direction must ALSO bump reqId.current and cancel the pending debounce,
+// or an in-flight response repopulates a box the user just emptied.
+```
+Use the same guard on admin list views (`listReqId`) — filter and tab switches race identically.
+
+### 2. Session expiry belongs in one place
+
+A token that expires mid-session makes every subsequent write fail with a generic toast, leaving the user
+stuck with no way out. Route every response through one handler: on **401/403**, clear the stored session
+and redirect to login with a "Session expired" message, instead of surfacing a raw error at each call
+site. Put it in the fetch wrapper/interceptor so call site #147 can't forget.
+
+### 3. Canvas → image export (share / download cards)
+
+- **`canvas.toBlob` can resolve `null`** (tainted canvas, OOM). Using the blob unconditionally emits a
+  blank or corrupt PNG. Null-check it, and share one `renderCardBlob()` helper between Share and Download
+  so the check exists exactly once.
+- **A failed image load taints the canvas.** If the logo/avatar loader falls back to resolving the *raw
+  URL* on error, that cross-origin image taints the `html2canvas` capture and the export dies. Resolve
+  `null` on error and render the card without the image.
+- **Concurrent Share + Download need a synchronous lock.** React state lags a render, so an
+  `isGenerating` *state* check lets a double-tap through. Use a ref:
+  `if (generatingRef.current) return; generatingRef.current = true;` in a `try/finally`.
+- **A tight `line-height` inside `overflow: hidden` clips serif ascenders in the rasterized output.** The
+  card looks right in the browser (glyphs overflow their line box harmlessly) but the capture crops them,
+  so a display serif's `f`/`h`/`l`/diacritics lose their tops in the exported PNG only. Keep the card's
+  headline at `lineHeight ≥ 1.25` rather than a designer's `1.05`, or drop the `overflow: hidden` on that
+  element. Always review the *exported file*, not the on-screen card — they are two different renderers.
+
+### 4. Defensive defaults on API-shaped state
+
+A malformed or partial response leaves `pagination.total` undefined and crashes the results-count render.
+Merge over defaults at the boundary — `setPagination({ total: 0, hasMore: false, ...res.pagination })` —
+rather than optional-chaining at every read site.
+
+> Interrupting a flow with a login? The pending-intent-with-TTL handoff lives in `frontend-patterns`
+> ("Resume-an-action-after-login") — don't re-implement it here.
+
+## Deep links to records that may not exist
+
+A link or chip pointing at a record that was never created (a synonym absent from the dictionary, a
+deleted job, a bad `?id=` param) must not be a silent dead click. Either don't render it as a link, or
+show a transient "…isn't available yet" notice. Pre-resolve which related ids actually exist and render
+only those as links — the check is one `find({ key: { $in: [...] } })`, not N requests.
+
+**Resolve a deep link with an exact-match endpoint — never a fuzzy search plus a client-side equality
+check.** The tempting shortcut for `?word=good` / `?ref=ACME` is to reuse the list search
+(`GET /items?q=good&limit=5`) and open whichever result matches exactly. It fails precisely for the most
+*common* values: a substring/regex search spans several fields, so dozens of other records mention the
+term (as a synonym, a tag, a description) and rank ahead of it — the exact record never appears in the
+first N, the equality check misses, and the deep link **silently does nothing** with no error to explain
+it. Rarer values work fine, which is why it survives testing. Add `GET /items/by-key/:key` doing a
+`findOne({ keyLower })` and point the boot effect at that; keep the fuzzy search for the search box only.
+
+**Highlighting a term inside a sentence: `\b` is ASCII-only.** `new RegExp(\`\\b${esc(term)}\\b\`, 'gi')`
+silently fails to match whenever the term or its neighbours are non-Latin (Bangla, Cyrillic, CJK,
+accented Latin), so bilingual example sentences render unhighlighted. Split on a plain capture group and
+compare case-insensitively per part instead — the equality check, not the regex, is what guarantees
+correctness:
+```js
+const parts = sentence.split(new RegExp(`(${escapeRegExp(term)})`, 'gi'));
+parts.map(p => p.toLowerCase() === term.toLowerCase() ? <mark key={p}>{p}</mark> : p);
+```
+
+## Module-level media objects keep streaming after the component is gone
+
+A shared `const audio = new Audio()` (or a single `<video>`/`AudioContext`/`MediaRecorder`) parked at module
+scope is convenient — one instance, no re-creation, easy "stop the previous clip before starting the next".
+But nothing in a component's unmount touches it, so navigating away mid-playback in an SPA leaves the
+request **open and streaming**; a proxied/generated source (a TTS endpoint, an on-demand transcode) then
+holds a live server connection per navigation, and they accumulate for the session. `src=""` alone isn't
+enough on some browsers — pause, clear, then load:
+```js
+// media.js
+let el = null;
+export function play(src){ stop(); el = new Audio(src); return el.play(); }
+export function stop(){ if (!el) return; el.pause(); el.src = ''; el.load(); el = null; }
+// every component that can start playback:
+useEffect(() => stop, []);      // cleanup on unmount, and on route change via the same unmount
+```
+The module owning the element must **export the stopper** — a singleton with no public `stop()` is the bug.

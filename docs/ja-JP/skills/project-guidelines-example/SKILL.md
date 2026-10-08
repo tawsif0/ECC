@@ -3,6 +3,7 @@ name: project-guidelines-example
 description: Project-specific skill template covering architecture, patterns, testing, and deployment guidance.
 metadata:
   origin: ECC
+description: "プロジェクトガイドラインスキル（例）"
 ---
 
 # プロジェクトガイドラインスキル（例）

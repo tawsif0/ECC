@@ -120,6 +120,20 @@ HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost:3000/heal
 CMD ["node", "dist/server.js"]
 ```
 
+**Slim-image HEALTHCHECK without `wget`/`curl`.** `node:*-slim` (Debian slim) ships no `wget` or
+`curl`, so the `wget -qO- … || exit 1` check above silently fails. On Node 18+ use the built-in
+`fetch` instead — no extra package, and it respects `process.env.PORT`:
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+```
+Coolify/Docker consume the resulting `healthy`/`unhealthy` status for zero-downtime swaps.
+
+**One persistent uploads volume can serve MORE than uploads.** A single mounted `/app/uploads`
+volume (that survives redeploys) is the natural home for anything else that must persist without an
+extra mount — e.g. a desktop app's self-hosted auto-update feed served as static files from an
+`_updates/` subfolder (see `electron-desktop-app`). Mount once, reuse for images **and** the feed.
+
 ### Override Files
 
 ```yaml
